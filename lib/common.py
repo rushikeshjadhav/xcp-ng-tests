@@ -114,6 +114,7 @@ class Host:
         self.xo_srv_id = None
         self.user = None
         self.password = None
+        self.saved_packages_list = None
 
     def __str__(self):
         return self.hostname_or_ip
@@ -254,13 +255,36 @@ class Host:
             else:
                 raise
 
-    def yum_install(self, packages):
+    def yum_install(self, packages, enablerepo=None, save_state=False):
         print('Install packages: %s on host %s' % (' '.join(packages), self))
-        return self.ssh(['yum', 'install', '-y'] + packages)
+        if save_state:
+            # For now, that saved state feature does not support several saved states
+            assert self.saved_packages_list is None
+            self.saved_packages_list = self.packages()
+        enablerepo_cmd = ['--enablerepo=%s' % enablerepo] if enablerepo is not None else []
+        return self.ssh(['yum', 'install', '-y'] + enablerepo_cmd + packages)
 
     def yum_remove(self, packages):
         print('Remove packages: %s from host %s' % (' '.join(packages), self))
         return self.ssh(['yum', 'remove', '-y'] + packages)
+
+    def packages(self):
+        """ returns the list of installed RPMs - without their version """
+        return sorted(self.ssh(['rpm', '-qa', '--qf', '%{NAME}\\\\n']).splitlines())
+
+    def yum_remove_added_packages(self, base_packages):
+        """ Compare the list of installed packages with a previous known list and remove the added ones """
+        packages = self.packages()
+        packages_to_remove = [p for p in packages if p not in base_packages]
+        if packages_to_remove:
+            return self.yum_remove(packages_to_remove)
+        else:
+            print("No added packages to remove.")
+
+    def yum_restore_saved_state(self):
+        """ Currently only able to remove added packages """
+        assert self.saved_packages_list is not None, "Can't restore previous state without a package list"
+        self.yum_remove_added_packages(self.saved_packages_list)
 
     def reboot(self, verify=False, reconnect_xo=True):
         print("Reboot host %s" % self)
@@ -288,7 +312,7 @@ class Host:
     def file_exists(self, filepath):
         return self.ssh_with_result(['test', '-f', filepath]).returncode == 0
 
-    def sr_create(self, sr_type, label, device_config, shared=False):
+    def sr_create(self, sr_type, label, device_config, shared=False, verify=False):
         params = {
             'host-uuid': self.uuid,
             'type': sr_type,
@@ -304,7 +328,10 @@ class Host:
             (sr_type, self, str(device_config), label)
         )
         sr_uuid = self.xe('sr-create', params)
-        return SR(sr_uuid, self.pool)
+        sr = SR(sr_uuid, self.pool)
+        if verify:
+            wait_for(sr.exists, "Wait for SR to exist")
+        return sr
 
     def is_master(self):
         return self.ssh(['cat', '/etc/xensource/pool.conf']) == 'master'

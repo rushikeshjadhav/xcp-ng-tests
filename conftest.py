@@ -36,6 +36,13 @@ def pytest_addoption(parser):
         default=[],
         help="VM keys or OVA URLs for tests that require several VMs",
     )
+    parser.addoption(
+        "--sr-device-config",
+        action="append",
+        default=[],
+        help="device-config keys and values for a remote SR. " \
+             "Example: 'server:10.0.0.1,serverpath:/vms,nfsversion:4.1'.",
+    )
 
 def host_data(hostname_or_ip):
     # read from data.py
@@ -87,14 +94,18 @@ def host(hostA1):
 def hostA2(hostA1):
     """ Second host of pool A """
     assert len(hostA1.pool.hosts) > 1, "A second host in first pool is required"
-    yield hostA1.pool.hosts[1]
+    _hostA2 = hostA1.pool.hosts[1]
+    print(">>> hostA2 present: %s" % _hostA2)
+    yield _hostA2
 
 @pytest.fixture(scope='session')
 def hostB1(hosts):
     """ Master of second pool (pool B) """
     assert len(hosts) > 1, "A second pool is required"
     assert hosts[0].pool.uuid != hosts[1].pool.uuid
-    yield hosts[1]
+    _hostB1 = hosts[1]
+    print(">>> hostB1 present: %s" % _hostB1)
+    yield _hostB1
 
 @pytest.fixture(scope='session')
 def local_sr_on_hostA2(hostA2):
@@ -102,7 +113,9 @@ def local_sr_on_hostA2(hostA2):
     srs = hostA2.local_vm_srs()
     assert len(srs) > 0, "a local SR is required on the pool's second host"
     # use the first local SR found
-    yield srs[0]
+    sr = srs[0]
+    print(">> local SR on hostA2 present : %s" % sr.uuid)
+    yield sr
 
 @pytest.fixture(scope='session')
 def local_sr_on_hostB1(hostB1):
@@ -110,7 +123,9 @@ def local_sr_on_hostB1(hostB1):
     srs = hostB1.local_vm_srs()
     assert len(srs) > 0, "a local SR is required on the second pool's master"
     # use the first local SR found
-    yield srs[0]
+    sr = srs[0]
+    print(">> local SR on hostB1 present : %s" % sr.uuid)
+    yield sr
 
 @pytest.fixture(scope='session')
 def sr_disk(host):
@@ -118,7 +133,15 @@ def sr_disk(host):
     # there must be at least 2 disks
     assert len(disks) > 1, "at least two disks are required on the first host"
     # Using the second disk for SR
-    yield disks[1]
+    disk = disks[1]
+    print(">> a second disk for a local SR is present on hostA1: %s" % disk)
+    yield disk
+
+@pytest.fixture(scope='session')
+def sr_disk_wiped(host, sr_disk):
+    print(">> wipe disk %s" % sr_disk)
+    host.ssh(['wipefs', '-a', '/dev/' + sr_disk])
+    yield sr_disk
 
 @pytest.fixture(scope='module')
 def vm_ref(request):
@@ -190,13 +213,20 @@ def running_linux_vm(imported_vm):
     return vm
     # no teardown
 
-# @pytest.fixture(scope="session")
-# def context():
-#     # Sort of global context to pass general information and configuration to test functions
-#     data = {}
-#     with open('vms.json') as f:
-#         data['VMs'] = json.loads(f.read())
-#     return data
+@pytest.fixture(scope='session')
+def sr_device_config(request):
+    raw_config = request.param
+
+    if raw_config is None:
+        # Use defaults
+        return None
+
+    config = {}
+    for key_val in raw_config.split(','):
+        key = key_val.split(':')[0]
+        value = key_val[key_val.index(':')+1:]
+        config[key] = value
+    return config
 
 def pytest_generate_tests(metafunc):
     if "hosts" in metafunc.fixturenames:
@@ -211,3 +241,10 @@ def pytest_generate_tests(metafunc):
         if not vm_lists:
             vm_lists = [None] # no --vms parameter does not mean skip the test, for us, it means use the default
         metafunc.parametrize("vm_refs", vm_lists, indirect=True, scope="module")
+    if "sr_device_config" in metafunc.fixturenames:
+        configs = metafunc.config.getoption("sr_device_config")
+        if not configs:
+            # No --sr-device-config parameter doesn't mean skip the test.
+            # For us it means use the defaults.
+            configs = [None]
+        metafunc.parametrize("sr_device_config", configs, indirect=True, scope="session")
