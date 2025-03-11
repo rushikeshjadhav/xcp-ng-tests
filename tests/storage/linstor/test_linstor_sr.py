@@ -226,6 +226,52 @@ class TestLinstorSR:
         hostB1.pool = hostB1_pool # Post eject, reset hostB1.pool for next run ("thick")
         hostB1.yum_remove([LINSTOR_PACKAGE]) # Package cleanup
 
+    @pytest.mark.small_vm
+    def test_linstor_sr_reduce_disk(self, linstor_sr, provisioning_type, vm_on_linstor_sr):
+        """
+        Identify hosts within the same pool, detect free disks, create LVM, and integrate it into LINSTOR SR.
+        """
+        if provisioning_type == "thin":
+            logging.info(f"* SR reductoin by removing device is not supported for {provisioning_type} type *")
+            return
+        sr = linstor_sr
+        vm = vm_on_linstor_sr
+        vm.start()
+        sr_size = int(sr.pool.master.xe('sr-param-get', {'uuid': sr.uuid, 'param-name': 'physical-size'}))
+        resized = False
+
+        for h in sr.pool.hosts:
+            logging.info("* Working on {}*".format(h.hostname_or_ip))
+            devices = h.ssh('vgs ' + GROUP_NAME + ' -o pv_name --no-headings').split("\n")
+            assert len(devices) > 1, "This test requires {GROUP_NAME} to have more than 1 disk or parition"
+            eject_device = devices[-1].strip()
+            logging.info(f"Attempting to remove device: {eject_device}")
+            try:
+                h.ssh(['pvmove', eject_device]) # Choosing last device from list, assuming its least filled
+                h.ssh(['vgreduce', GROUP_NAME, eject_device])
+                h.ssh(['pvremove', eject_device])
+            except SSHCommandFailed as e:
+                if "No data to move for" in e.stdout:
+                    h.ssh(['vgreduce', GROUP_NAME, eject_device])
+                    h.ssh(['pvremove', eject_device])
+                else:
+                    pytest.fail("Failed to empty device")
+            h.ssh('systemctl restart linstor-satellite.service')
+            resized = True
+
+        # Need to ensure that linstor is healthy/up-to-date before moving ahead.
+        time.sleep(30) # Wait time for Linstor node communications to restore after service restart.
+
+        sr.scan()
+
+        new_sr_size = int(sr.pool.master.xe('sr-param-get', {'uuid': sr.uuid, 'param-name': 'physical-size'}))
+        assert new_sr_size < sr_size and resized, \
+            f"Expected SR size to decrease but got old size: {sr_size}, new size: {new_sr_size}"
+        logging.info(f"* SR reduction by removing disk is completed from {sr_size} to {new_sr_size} *")
+        vm.shutdown(verify=True)
+        # Ensure VM is able to start and shutdown on reduce SR
+        self.test_start_and_shutdown_VM(vm)
+
     # *** tests with reboots (longer tests).
 
     @pytest.mark.reboot
