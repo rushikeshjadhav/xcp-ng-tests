@@ -272,6 +272,87 @@ class TestLinstorSR:
         # Ensure VM is able to start and shutdown on reduce SR
         self.test_start_and_shutdown_VM(vm)
 
+    @pytest.mark.small_vm
+    def test_linstor_sr_reduce_host(self, linstor_sr, host, hostA2, vm_on_linstor_sr):
+        """
+        Remove non master host from the same pool Linstor SR.
+        Do we measure the time taken by system to rebalance after host removal?
+        Should the host be graceful empty or force removal?
+        """
+        sr = linstor_sr
+        vm = vm_on_linstor_sr
+        vm.start()
+        sr_size = int(sr.pool.master.xe('sr-param-get', {'uuid': sr.uuid, 'param-name': 'physical-size'}))
+        resized = False
+        # Ensure that its a single host pool and not multi host pool
+        assert len(host.pool.hosts) > 3, "This test requires Pool to have more than 3 hosts"
+
+        # Avoid ejecting host being master
+        ejecting_host = hostA2.xe('host-param-get', {'uuid': hostA2.uuid,
+                                                     'param-name': 'name-label'})
+        linstorhost = host
+        for h in host.pool.hosts:
+            if h.ssh_with_result(["ss -tuln | grep 3370"]).returncode == 0: # Expecting output from linstor CLI
+                linstorhost = h
+                break
+
+        # Check if linstor controller host is same as ejeting host.
+        if linstorhost.xe('host-param-get', {'uuid': linstorhost.uuid,
+                                             'param-name': 'name-label'}) == ejecting_host:
+            logging.info("Ejecting Host is running Linstor, will stop the service here.")
+            # Need to handle this case as it will create failure in "linstor node delete" due to self deletion
+            linstorhost.ssh("systemctl stop linstor-controller.service")
+            linstorhost.ssh("systemctl stop drbd-reactor.service")
+            time.sleep(30)
+
+        controller_option = "--controllers="
+        for member in host.pool.hosts:
+            controller_option += f"{member.hostname_or_ip},"
+
+        # Evacuate the node to be deleted
+        try:
+            host.ssh('xe host-evacuate uuid=' + hostA2.uuid)
+        except Exception as e:
+            logging.info("Could not evacuate host {}".format(e))
+            if "You attempted an operation on a VM which lacks the feature" in e.stdout:
+                vm.shutdown(verify=True, force_if_fails=True)
+                host.ssh('xe host-evacuate uuid=' + hostA2.uuid)
+                # Start VM on a host that is not ejecting
+                vm.start(on=(*{x.uuid for x in host.pool.hosts if x.uuid != hostA2.uuid},)[0])
+
+        # Need to stop linstor and drbd-reactor services
+        hostA2.ssh("systemctl stop linstor-controller.service")
+        hostA2.ssh("systemctl stop drbd-reactor.service")
+        hostA2.ssh("systemctl stop linstor-satellite.service")
+        # Need to delete respective pbd of that host
+        pbd_to_unplug = host.xe('pbd-list', {'sr-uuid': sr.uuid, 'host-uuid': hostA2.uuid}, minimal=True)
+        host.xe('pbd-unplug', {'uuid': pbd_to_unplug})
+        # Delete node from Linstor pool
+        logging.info(host.ssh_with_result(["linstor", controller_option, "node", "delete", ejecting_host]).stdout)
+        # Eject host from pool
+        host.pool.eject_host(hostA2)
+
+        # Restart satellite services for clean state. This can be optional.
+        for h in host.pool.hosts:
+            h.ssh(['systemctl', 'restart', 'linstor-satellite.service'])
+
+        time.sleep(30) # Wait till all services become normal
+
+        resized = True
+        sr.scan()
+        new_sr_size = int(sr.pool.master.xe('sr-param-get', {'uuid': sr.uuid, 'param-name': 'physical-size'}))
+        assert new_sr_size < sr_size and resized, \
+            f"Expected SR size to decrease but got old size: {sr_size}, new size: {new_sr_size}"
+        logging.info(f"* SR reduction by removing host is completed from {sr_size} to {new_sr_size} *")
+        vm.shutdown(verify=True)
+
+        # Ensure VM is able to start and shutdown on reduced SR
+        self.test_start_and_shutdown_VM(vm)
+
+        # Rejoin the host into pool for next run
+        hostA2.join_pool(host.pool)
+        # Pytest teardown will habdle remaining teardown (SR destroy, Device destroy, Package uninstall)
+
     # *** tests with reboots (longer tests).
 
     @pytest.mark.reboot
